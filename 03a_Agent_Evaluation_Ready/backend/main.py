@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+"""
+New StoryGen Backend - Using Agent-Based Architecture
+This version uses the new story_image_agent with full ADK agent capabilities
+"""
 import os
 import json
 import asyncio
@@ -17,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from story_agent.agent import root_agent as story_agent
-from story_agent.story_image_function import DirectImageFunction
+from story_image_agent.agent import root_agent as image_agent  # New image agent
 
 # Load environment variables
 load_dotenv()
@@ -27,10 +31,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Application constants
-APP_NAME = "storygen_app"
+APP_NAME = "storygen_new_app"
 
 # Initialize FastAPI app
-app = FastAPI(title="StoryGen Backend", description="ADK-powered story generation backend")
+app = FastAPI(title="StoryGen Backend (New)", description="ADK-powered story generation with agent-based image generation")
 
 # Add CORS middleware to allow frontend connections
 app.add_middleware(
@@ -45,37 +49,59 @@ app.add_middleware(
 # Initialize session service and agents
 project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT_ID")
 
-# Initialize the DirectImageFunction
-direct_image_function = None
+# Initialize agent runners
+story_runner = None
+image_runner = None
+
 if project_id:
     try:
-        direct_image_function = DirectImageFunction(project_id=project_id)
-        logger.info("✅ DirectImageFunction initialized for direct image generation")
+        # Initialize story agent runner (existing)
+        story_runner = InMemoryRunner(app_name=APP_NAME, agent=story_agent)
+
+        # Initialize new image agent runner
+        image_runner = InMemoryRunner(app_name=APP_NAME, agent=image_agent)
+
+        print("✅ New Architecture initialized: StoryAgent + CustomImageAgent")
+        print(f"🎨 Custom Image Agent ready for direct tool execution")
     except Exception as e:
-        logger.warning(f"⚠️ Could not initialize DirectImageFunction: {e}")
+        print(f"⚠️ Warning: Could not initialize agents: {e}")
+        print("📖 Story generation may not work properly")
 else:
-    logger.info("💡 To enable direct image generation, set GOOGLE_CLOUD_PROJECT_ID in your .env file")
+    print("💡 To enable image generation, set GOOGLE_CLOUD_PROJECT_ID in your .env file")
 
 
-async def run_two_agent_workflow(websocket: WebSocket, user_id: str, keywords: str):
+async def run_new_agent_workflow(websocket: WebSocket, user_id: str, keywords: str):
     """
-    Clean two-agent workflow:
+    New agent-based workflow:
     1. StoryAgent generates structured story with scene data
-    2. ImageAgent generates images for each scene
+    2. New ImageAgent generates images for each scene using conversational AI
     3. Stream results to frontend as they're ready
     """
-    logger.info(f"🚀 Starting two-agent workflow for user {user_id} with keywords: '{keywords}'")
+    logger.info(f"🚀 Starting new agent workflow for user {user_id} with keywords: '{keywords}'")
 
-    # Step 1: Generate structured story using StoryAgent
+    if not story_runner or not image_runner:
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": "Agent runners not properly initialized"
+        }))
+        return
+
+    # Step 1: Generate structured story using StoryAgent (same as before)
     story_data = None
     try:
         logger.info("📖 Generating story with StoryAgent...")
-        story_runner = InMemoryRunner(app_name=APP_NAME, agent=story_agent)
-        story_session = await story_runner.session_service.create_session(app_name=APP_NAME, user_id=f"{user_id}_story")
+        story_session = await story_runner.session_service.create_session(
+            app_name=APP_NAME,
+            user_id=f"{user_id}_story"
+        )
         story_content = Content(role="user", parts=[Part(text=f"Keywords: {keywords}")])
 
         story_response = ""
-        async for event in story_runner.run_async(user_id=f"{user_id}_story", session_id=story_session.id, new_message=story_content):
+        async for event in story_runner.run_async(
+            user_id=f"{user_id}_story",
+            session_id=story_session.id,
+            new_message=story_content
+        ):
             if event.content and event.content.parts:
                 for part in event.content.parts:
                     if part.text:
@@ -124,9 +150,9 @@ async def run_two_agent_workflow(websocket: WebSocket, user_id: str, keywords: s
         await websocket.send_text(json.dumps({"type": "error", "message": f"Story generation failed: {e}"}))
         return
 
-    # Step 2: Generate images using DirectImageAgent
+    # Step 2: Generate images using CustomImageAgent
     if story_data and story_data.get("scenes"):
-        logger.info("🎨 Starting image generation...")
+        logger.info("🎨 Starting image generation with CustomImageAgent...")
 
         # Extract character descriptions from story data
         character_descriptions = {}
@@ -138,6 +164,12 @@ async def run_two_agent_workflow(websocket: WebSocket, user_id: str, keywords: s
                     character_descriptions[char_name] = char_desc
             logger.info(f"📚 Found {len(character_descriptions)} main character(s): {', '.join(character_descriptions.keys())}")
 
+        # Create image session
+        image_session = await image_runner.session_service.create_session(
+            app_name=APP_NAME,
+            user_id=f"{user_id}_image"
+        )
+
         for scene in story_data["scenes"]:
             scene_index = scene.get("index", 1) - 1  # Convert to 0-based index
             scene_description = scene.get("description", "")
@@ -146,17 +178,45 @@ async def run_two_agent_workflow(websocket: WebSocket, user_id: str, keywords: s
             try:
                 logger.info(f"🖼️ Generating image for scene {scene_index + 1}: {scene_title}")
 
-                # Use the DirectImageFunction
-                image_data = await direct_image_function.generate_image_from_description(
-                    description=scene_description,
-                    character_descriptions=character_descriptions
-                )
+                logger.info(f"📝 Processing scene description: {scene_description[:100]}...")
+                logger.info(f"👥 Using character descriptions: {list(character_descriptions.keys())}")
+
+                # Create content with all necessary data for CustomImageAgent
+                prompt_data = {
+                    "scene_title": scene_title,
+                    "scene_description": scene_description,
+                    "character_descriptions": character_descriptions
+                }
+                image_content = Content(role="user", parts=[Part(text=json.dumps(prompt_data))])
+
+                # Process all events from the custom agent
+                image_data_str = ""
+                async for event in image_runner.run_async(
+                    user_id=f"{user_id}_image",
+                    session_id=image_session.id,
+                    new_message=image_content
+                ):
+                    logger.info(f"📥 Event from CustomImageAgent: {event.author if hasattr(event, 'author') else 'unknown'}")
+                    if event.content and event.content.parts:
+                        for part in event.content.parts:
+                            if part.text:
+                                image_data_str += part.text
+
+                # After the loop, parse the accumulated string
+                if image_data_str:
+                    try:
+                        image_data = json.loads(image_data_str)
+                        logger.info("✅ Parsed image result from agent event")
+                    except json.JSONDecodeError:
+                        logger.error("❌ Failed to parse image result from agent event")
+                else:
+                    logger.warning("⚠️ Agent did not yield any content in events")
 
                 if image_data and image_data.get("images"):
                     for img_data in image_data["images"]:
                         image_payload = {
                             "index": scene_index,
-                            "scene_title": scene.get("title", ""),
+                            "scene_title": scene_title,
                             "format": img_data.get("format", "png"),
                             "stored_in_bucket": img_data.get("stored_in_bucket", False)
                         }
@@ -176,14 +236,14 @@ async def run_two_agent_workflow(websocket: WebSocket, user_id: str, keywords: s
                         }))
                         logger.info(f"📤 Sent image for scene {scene_index + 1} to frontend")
                 else:
-                    raise Exception(f"Image generation failed: {image_data.get('error', 'Unknown error')}")
+                    raise Exception("Image agent did not return valid image data")
 
             except Exception as e:
                 logger.error(f"Image generation failed for scene {scene_index + 1}: {e}")
                 # Send error placeholder so frontend knows this slot exists
                 error_payload = {
                     "index": scene_index,
-                    "scene_title": scene.get("title", ""),
+                    "scene_title": scene_title,
                     "format": "png",
                     "stored_in_bucket": False,
                     "error": f"Image generation failed: {str(e)}",
@@ -199,10 +259,10 @@ async def run_two_agent_workflow(websocket: WebSocket, user_id: str, keywords: s
             if scene_index < len(story_data["scenes"]) - 1:
                 await asyncio.sleep(2)
 
-        logger.info("🎨 All image generation completed")
+        logger.info("🎨 All image generation completed with New ImageAgent")
     else:
-        if not direct_image_function:
-            logger.warning("⚠️ DirectImageFunction not available, skipping image generation")
+        if not image_runner:
+            logger.warning("⚠️ Image agent runner not available, skipping image generation")
         elif not story_data.get("scenes"):
             logger.warning("⚠️ No scenes found in story data, skipping image generation")
 
@@ -210,24 +270,23 @@ async def run_two_agent_workflow(websocket: WebSocket, user_id: str, keywords: s
     await websocket.send_text(json.dumps({"type": "turn_complete", "turn_complete": True}))
 
 
-
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     """
-    WebSocket endpoint for real-time story generation
+    WebSocket endpoint for real-time story generation using new agent architecture
 
     Args:
         websocket: WebSocket connection
         user_id: Unique user identifier
     """
     await websocket.accept()
-    logger.info(f"Client #{user_id} connected")
+    logger.info(f"Client #{user_id} connected to NEW backend")
 
     try:
         # Send connection confirmation
         await websocket.send_text(json.dumps({
             "type": "connected",
-            "message": "Connected to StoryGen backend"
+            "message": "Connected to StoryGen NEW backend (agent-based)"
         }))
 
         while True:
@@ -243,17 +302,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     # Send processing notification
                     await websocket.send_text(json.dumps({
                         "type": "processing",
-                        "message": "Generating story and images..."
+                        "message": "Generating story and images with NEW agents..."
                     }))
 
-                    # Run the clean two-agent workflow
-                    await run_two_agent_workflow(websocket, user_id, data)
+                    # Run the new agent-based workflow
+                    await run_new_agent_workflow(websocket, user_id, data)
 
                 except Exception as e:
-                    logger.error(f"Error in websocket workflow for user {user_id}: {e}")
+                    logger.error(f"Error in new websocket workflow for user {user_id}: {e}")
                     await websocket.send_text(json.dumps({
                         "type": "error",
-                        "message": f"Workflow failed: {str(e)}"
+                        "message": f"NEW workflow failed: {str(e)}"
                     }))
 
             elif message_type == "ping":
@@ -264,25 +323,40 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 logger.warning(f"Unknown message type: {message_type}")
 
     except WebSocketDisconnect:
-        logger.info(f"Client #{user_id} disconnected")
+        logger.info(f"Client #{user_id} disconnected from NEW backend")
     except Exception as e:
-        logger.error(f"WebSocket error for user {user_id}: {e}")
+        logger.error(f"WebSocket error for user {user_id} on NEW backend: {e}")
         try:
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "message": f"Server error: {str(e)}"
+                "message": f"NEW server error: {str(e)}"
             }))
         except:
             pass
     finally:
-        logger.info(f"Client #{user_id} connection closed")
+        logger.info(f"Client #{user_id} connection closed on NEW backend")
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "service": "storygen-backend"}
+    return {
+        "status": "healthy",
+        "service": "storygen-backend-new",
+        "architecture": "agent-based"
+    }
 
-
+# @app.get("/")
+# async def root():
+#     """Root endpoint"""
+#     return {
+#         "message": "StoryGen Backend API (NEW)",
+#         "version": "3.0.0",
+#         "workflow": "agent-based",
+#         "agents": {
+#             "story": "story_agent (existing)",
+#             "image": "new_image_agent (with tools)"
+#         }
+#     }
 
 # Serve frontend
 STATIC_FILES_DIR = os.environ.get("STATIC_FILES_DIR", "../frontend/out")
